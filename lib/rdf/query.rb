@@ -69,6 +69,7 @@ module RDF
   class Query
     include Enumerable
     autoload :Pattern,   'rdf/query/pattern'
+    autoload :Provenance, 'rdf/query/provenance'
     autoload :Solution,  'rdf/query/solution'
     autoload :Solutions, 'rdf/query/solutions'
     autoload :Variable,  'rdf/query/variable'
@@ -140,6 +141,9 @@ module RDF
     # @return [RDF::Resource, RDF::Query::Variable, false] graph_name
     attr_accessor :graph_name
 
+    # @return [Boolean] whether solutions are annotated with provenance
+    attr_reader :provenance
+
     ##
     # Initializes a new basic graph pattern query.
     #
@@ -157,6 +161,8 @@ module RDF
     #     The name of `false` will only match against the default graph.
     #   @option options [RDF::Resource, RDF::Query::Variable, false] :name (nil)
     #     Alias for `:graph_name`.
+    #   @option options [Boolean] :provenance (false)
+    #     Attach a symbolic provenance expression to each solution.
     #   @yield  [query]
     #   @yieldparam  [RDF::Query] query
     #   @yieldreturn [void] ignored
@@ -180,11 +186,12 @@ module RDF
     #   @yield  [query]
     #   @yieldparam  [RDF::Query] query
     #   @yieldreturn [void] ignored
-    def initialize(*patterns, solutions: nil, graph_name: nil, name: nil, validate: false, **options, &block)
+    def initialize(*patterns, solutions: nil, graph_name: nil, name: nil, validate: false, provenance: false, **options, &block)
       @options = options.dup
       @solutions = Query::Solutions(solutions)
       graph_name = name if graph_name.nil?
       @graph_name = graph_name
+      @provenance = provenance
 
       patterns << @options if patterns.empty?
 
@@ -295,6 +302,8 @@ module RDF
     #   optional variable bindings to use
     # @option options [Boolean] :optimize
     #   Optimize query before execution.
+    # @option options [Boolean] :provenance (false)
+    #   Attach a symbolic provenance expression to each solution.
     # @option options [RDF::Query::Solutions] solutions
     #   optional initial solutions for chained queries
     # @yield  [solution]
@@ -305,12 +314,14 @@ module RDF
     #   the resulting solution sequence
     # @see    http://www.holygoat.co.uk/blog/entry/2005-10-25-1
     # @see    http://www.w3.org/TR/sparql11-query/#emptyGroupPattern
-    def execute(queryable, bindings: {}, solutions: Solution.new, graph_name: nil, name: nil, **options, &block)
+    def execute(queryable, bindings: {}, solutions: Solution.new, graph_name: nil, name: nil, provenance: @provenance, **options, &block)
       # Use provided solutions to allow for query chaining
       # Otherwise, a quick empty solution simplifies the logic below; no special case for
       # the first pattern
       @solutions = Query::Solutions(solutions)
       bindings = bindings.to_h if bindings.is_a?(Solution)
+      provenance_builder = provenance ? Provenance::Builder.new : nil
+      @solutions = add_provenance(@solutions, provenance_builder)
 
       # If there are no patterns, just return the empty solution
       if empty?
@@ -341,24 +352,30 @@ module RDF
             unbound_solutions, old_solutions = old_solutions, Query::Solutions()
             Array(bindings[variable]).each do |binding|
               unbound_solutions.each do |solution|
-                old_solutions << solution.merge(variable => binding)
+                old_solutions << solution.merge({variable => binding})
               end
             end
             bindings.delete(variable)
           end
         end
 
+        old_solutions = add_provenance(old_solutions, provenance_builder)
+
         old_solutions.each do |solution|
+          candidate_solutions = Query::Solutions()
           found_match = false
           pattern.execute(queryable, solution) do |statement|
             found_match = true
-            @solutions << solution.merge(pattern.solution(statement))
+            expression = solution.provenance
+            expression = provenance_builder.product(expression, provenance_builder.variable(statement)) if provenance_builder
+            candidate_solutions << solution.merge(pattern.solution(statement), provenance: expression)
           end
           # If this pattern was optional, and we didn't find any matches,
           # just copy it over as-is.
           if !found_match && pattern.optional?
-            @solutions << solution
+            candidate_solutions << solution
           end
+          @solutions.concat(add_provenance(candidate_solutions, provenance_builder))
         end
 
         #puts "solutions after #{pattern} are #{@solutions.to_a.inspect}"
@@ -524,7 +541,7 @@ module RDF
     # @return [RDF::Query]
     def dup
       patterns = @patterns.map {|p| p.dup}
-      Query.new(patterns, graph_name: graph_name, solutions: @solutions.dup, **options)
+      Query.new(patterns, graph_name: graph_name, solutions: @solutions.dup, provenance: @provenance, **options)
     end
 
     ##
@@ -560,6 +577,24 @@ module RDF
     end
 
   protected
+
+    # @private
+    def add_provenance(solutions, builder)
+      return solutions unless builder
+
+      solutions = solutions.map do |solution|
+        solution = Solution.new(solution) unless solution.is_a?(Solution)
+        expression = solution.provenance || Provenance.one
+        solution.dup(provenance: expression)
+      end
+
+      grouped = solutions.group_by(&:bindings)
+      Query::Solutions(solutions.uniq(&:bindings).map do |solution|
+        alternatives = grouped[solution.bindings].map(&:provenance)
+        expression = alternatives.reduce { |left, right| builder.sum(left, right) }
+        solution.dup(provenance: expression)
+      end)
+    end
 
     ##
     # @private

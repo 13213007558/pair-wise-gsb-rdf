@@ -39,8 +39,9 @@ class RDF::Query
     #
     # @param  [Hash{Symbol => RDF::Term}] bindings
     # @yield  [solution]
-    def initialize(bindings = {}, &block)
+    def initialize(bindings = {}, provenance_expression = nil, &block)
       @bindings = bindings.to_h
+      @provenance = provenance_expression
 
       if block_given?
         case block.arity
@@ -52,6 +53,10 @@ class RDF::Query
 
     # @private
     attr_reader :bindings
+
+    ##
+    # @return [RDF::Query::Provenance::Expression, nil]
+    attr_reader :provenance
 
     ##
     # Enumerates over every variable binding in this solution.
@@ -218,7 +223,7 @@ class RDF::Query
     #   another query solution or hash bindings
     # @return [void] self
     # @since  0.3.0
-    def merge!(other)
+    def merge!(other, provenance: nil)
       @bindings.merge!(other.to_h) do |key, v1, v2|
         # Don't merge a pattern over a statement
         # This happens because JOIN does a reverse merge,
@@ -234,6 +239,7 @@ class RDF::Query
       end
       # Merge embedded solutions
       embedded_solutions.each {|soln| merge!(soln)}
+      @provenance = provenance unless provenance.nil?
       self
     end
 
@@ -245,15 +251,15 @@ class RDF::Query
     #   another query solution or hash bindings
     # @return [RDF::Query::Solution]
     # @since  0.3.0
-    def merge(other)
-      self.class.new(@bindings.dup).merge!(other)
+    def merge(other, provenance: @provenance)
+      self.class.new(@bindings.dup, provenance).merge!(other)
     end
 
     ##
     # Duplicate solution, preserving patterns
     # @return [RDF::Statement]
-    def dup
-      merge({})
+    def dup(provenance: @provenance)
+      merge({}, provenance: provenance)
     end
 
     ##
