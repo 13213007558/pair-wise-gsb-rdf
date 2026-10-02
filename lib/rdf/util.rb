@@ -3,6 +3,7 @@ module RDF; module Util
   autoload :Cache,     'rdf/util/cache'
   autoload :File,      'rdf/util/file'
   autoload :Logger,    'rdf/util/logger'
+  autoload :Reification, 'rdf/util/reification'
   autoload :UUID,      'rdf/util/uuid'
   autoload :Coercions, 'rdf/util/coercions'
 end; end
