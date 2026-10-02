@@ -54,6 +54,15 @@ class RDF::Query
     attr_reader :bindings
 
     ##
+    # The provenance expression annotating this solution, recording which
+    # input statements were used to derive it. Only set when the query was
+    # executed with the `provenance` option; `nil` otherwise.
+    #
+    # @return [RDF::Query::Provenance::Node, nil]
+    # @see RDF::Query#execute
+    attr_accessor :provenance
+
+    ##
     # Enumerates over every variable binding in this solution.
     #
     # @yield  [name, value]
@@ -246,7 +255,9 @@ class RDF::Query
     # @return [RDF::Query::Solution]
     # @since  0.3.0
     def merge(other)
-      self.class.new(@bindings.dup).merge!(other)
+      solution = self.class.new(@bindings.dup).merge!(other)
+      solution.provenance = provenance
+      solution
     end
 
     ##

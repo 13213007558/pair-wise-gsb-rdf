@@ -73,6 +73,7 @@ module RDF
     autoload :Solutions, 'rdf/query/solutions'
     autoload :Variable,  'rdf/query/variable'
     autoload :HashPatternNormalizer, 'rdf/query/hash_pattern_normalizer'
+    autoload :Provenance, 'rdf/query/provenance'
 
     ##
     # Executes a query on the given `queryable` graph or repository.
@@ -297,6 +298,13 @@ module RDF
     #   Optimize query before execution.
     # @option options [RDF::Query::Solutions] solutions
     #   optional initial solutions for chained queries
+    # @param [Boolean, #call] provenance (nil)
+    #   Annotate each solution with a {RDF::Query::Provenance} expression
+    #   recording which statements were used to derive it: matched
+    #   statements contribute atoms, statements joined across patterns
+    #   multiply, and alternative derivations of equal bindings add.
+    #   Pass `true` to identify statements by themselves, or a callable
+    #   mapping each matched statement to a custom symbol.
     # @yield  [solution]
     #   each matching solution
     # @yieldparam  [RDF::Query::Solution] solution
@@ -305,15 +313,21 @@ module RDF
     #   the resulting solution sequence
     # @see    http://www.holygoat.co.uk/blog/entry/2005-10-25-1
     # @see    http://www.w3.org/TR/sparql11-query/#emptyGroupPattern
-    def execute(queryable, bindings: {}, solutions: Solution.new, graph_name: nil, name: nil, **options, &block)
+    def execute(queryable, bindings: {}, solutions: Solution.new, graph_name: nil, name: nil, provenance: nil, **options, &block)
       # Use provided solutions to allow for query chaining
       # Otherwise, a quick empty solution simplifies the logic below; no special case for
       # the first pattern
       @solutions = Query::Solutions(solutions)
       bindings = bindings.to_h if bindings.is_a?(Solution)
+      provenance = case provenance
+        when nil, false then nil
+        when true       then ->(statement) { statement }
+        else provenance.to_proc
+      end
 
       # If there are no patterns, just return the empty solution
       if empty?
+        @solutions.each {|solution| solution.provenance ||= Provenance.one} if provenance
         @solutions.each(&block) if block_given?
         return @solutions
       end
@@ -352,12 +366,22 @@ module RDF
           found_match = false
           pattern.execute(queryable, solution) do |statement|
             found_match = true
-            @solutions << solution.merge(pattern.solution(statement))
+            new_solution = solution.merge(pattern.solution(statement))
+            if provenance
+              new_solution.provenance = (solution.provenance || Provenance.one) * Provenance.atom(provenance.call(statement))
+              add_provenance_solution(@solutions, new_solution)
+            else
+              @solutions << new_solution
+            end
           end
           # If this pattern was optional, and we didn't find any matches,
           # just copy it over as-is.
           if !found_match && pattern.optional?
-            @solutions << solution
+            if provenance
+              add_provenance_solution(@solutions, solution)
+            else
+              @solutions << solution
+            end
           end
         end
 
@@ -580,6 +604,22 @@ module RDF
         end
       end
       patterns.map { |pattern| Pattern.from(pattern) }
+    end
+
+    ##
+    # Adds `solution` to `solutions`. When a solution with equal
+    # bindings is already present, sums both provenance expressions so
+    # that alternative derivations of the same bindings are merged
+    # rather than dropped.
+    #
+    # @private
+    def add_provenance_solution(solutions, solution)
+      solution.provenance ||= Provenance.one
+      if existing = solutions.find {|s| s == solution}
+        existing.provenance = (existing.provenance || Provenance.one) + solution.provenance
+      else
+        solutions << solution
+      end
     end
   end # Query
 end # RDF

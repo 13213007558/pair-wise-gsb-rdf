@@ -246,6 +246,20 @@ The same query may also be run from the graph:
 
 In general, querying from using the `queryable` instance allows a specific implementation of `queryable` to perform query optimizations specific to the datastore on which it is based.
 
+### Tracking query result provenance
+
+Pass `provenance: true` (or a callable mapping each matched statement to a symbol) when executing a query to annotate every solution with a provenance expression recording which input statements were used to derive it. Matched statements contribute atoms, statements joined across patterns multiply, and alternative derivations of equal bindings add:
+
+    solutions = query.execute(graph, provenance: true)
+    solutions.each do |solution|
+      puts solution.provenance
+    end
+
+Provenance expressions form a shared (DAG) structure and can be evaluated by substituting values for their symbols, for example to count derivations or check reachability:
+
+    expr.evaluate({stmt1 => 1, stmt2 => 1})       #=> Integer
+    expr.evaluate_boolean({stmt1 => true})        #=> true or false
+
 A separate [SPARQL][SPARQL doc] gem builds on basic BGP support to provide full support for [SPARQL 1.1][] queries.
 
 ### Using pre-defined RDF vocabularies
@@ -386,6 +400,7 @@ from BNode identity (i.e., they each entail the other)
 * {RDF::Query}
   * {RDF::Query::HashPatternNormalizer}
   * {RDF::Query::Pattern}
+  * {RDF::Query::Provenance}
   * {RDF::Query::Solution}
   * {RDF::Query::Solutions}
   * {RDF::Query::Variable}
