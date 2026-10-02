@@ -310,7 +310,7 @@ module RDF
     ##
     # Generates a Integer hash value as a quad.
     def hash
-      @hash ||= to_quad.hash
+      frozen? ? to_quad.hash : (@hash ||= to_quad.hash)
     end
 
     ##

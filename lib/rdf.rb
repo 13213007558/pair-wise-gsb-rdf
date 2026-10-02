@@ -53,6 +53,9 @@ module RDF
   # RDF querying
   autoload :Query,             'rdf/query'
 
+  # RDF 1.1 compatibility
+  autoload :Reification,       'rdf/reification'
+
   # RDF vocabularies
   autoload :Vocabulary,        'rdf/vocabulary'
   autoload :StrictVocabulary,  'rdf/vocabulary'
