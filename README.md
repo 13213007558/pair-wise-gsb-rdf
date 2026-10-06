@@ -297,6 +297,29 @@ By default, the N-Triples reader will reject a document containing a subject res
     end
     # => RDF::ReaderError
 
+### Converting between quoted triples and reification
+
+Systems which only accept plain RDF reification can exchange data with
+triple-term representations using {RDF::Statement#reified} and
+{RDF::Statement.from_reified}. Nested quoted triples are expanded into
+reification descriptions of their own; quoting a triple does not assert
+it, so quoted triples are not added to the graph as statements themselves.
+
+    statement = RDF::Statement(
+      RDF::URI('ex:s'),
+      RDF::URI('ex:p'),
+      RDF::Statement(RDF::URI('ex:s1'), RDF::URI('ex:p1'), RDF::URI('ex:o1')))
+
+    map = {} # identity table, preserved across batched conversions
+    graph = statement.reified(map: map)
+    RDF::Statement.from_reified(graph, map: map).first == statement
+    # => true
+
+Restoring a reification description which is incomplete, or which carries
+conflicting `rdf:subject`, `rdf:predicate`, or `rdf:object` values,
+raises {RDF::Statement::ReificationError} rather than picking an arbitrary
+value.
+
 ## Documentation
 
 <https://ruby-rdf.github.io/rdf>

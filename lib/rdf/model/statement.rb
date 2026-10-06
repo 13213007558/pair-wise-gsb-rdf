@@ -29,6 +29,13 @@ module RDF
     include RDF::Resource
 
     ##
+    # Raised when a reification description cannot be unambiguously restored
+    # to a statement: either it is incomplete (any of `rdf:subject`,
+    # `rdf:predicate`, or `rdf:object` is missing) or it carries multiple,
+    # conflicting values for any of them.
+    class ReificationError < RuntimeError; end
+
+    ##
     # @private
     # @since 0.2.2
     def self.from(statement, graph_name: nil, **options)
@@ -40,6 +47,97 @@ module RDF
         when Hash      then self.new(options.merge(statement))
         else raise ArgumentError, "expected RDF::Statement, Hash, or Array, but got #{statement.inspect}"
       end
+    end
+
+    ##
+    # Reconstructs a statement from its reified form, the inverse of
+    # {#reified}. Reification subjects which are themselves described by
+    # reification statements in `queryable` are restored as nested quoted
+    # statements.
+    #
+    # Restored statements are marked as `tripleTerm`, as quoting a statement
+    # does not assert it into the graph.
+    #
+    # @example Restoring a quoted statement from a reification description
+    #   statement = RDF::Statement(RDF::URI('s'), RDF::URI('p'), RDF::Statement(RDF::URI('s1'), RDF::URI('p1'), RDF::URI('o1')))
+    #   RDF::Statement.from_reified(statement.reified).first == statement
+    #   # => true
+    #
+    # @param  [RDF::Queryable] queryable
+    #   The graph (or other queryable) containing reification descriptions.
+    # @param  [RDF::Resource] subject
+    #   The reification subject to restore. If omitted, every top-level
+    #   reification subject found in `queryable` is restored.
+    # @param  [Hash{RDF::Statement => RDF::Resource}] map
+    #   Identity table, as in {#reified}. Restored statements are recorded
+    #   with the reification subject they were restored from, so a
+    #   caller-provided map is preserved and remains consistent across
+    #   batched conversions.
+    # @return [RDF::Statement, Array<RDF::Statement>]
+    #   A single statement when `subject` is given, otherwise an array of
+    #   statements, one per top-level reification subject found.
+    # @raise  [ReificationError]
+    #   If the reification description is incomplete or ambiguous.
+    # @see    #reified
+    def self.from_reified(queryable, subject: nil, map: nil)
+      map ||= {}
+      unless subject
+        return reification_subjects(queryable).map do |reifier|
+          from_reified(queryable, subject: reifier, map: map)
+        end
+      end
+
+      triple = {}
+      {subject: RDF.subject, predicate: RDF.predicate, object: RDF.object}.each do |key, property|
+        values = []
+        queryable.query([subject, property, nil]) do |statement|
+          values << statement.object unless values.include?(statement.object)
+        end
+        if values.empty?
+          raise ReificationError, "incomplete reification of #{subject.to_base}: no rdf:#{key} description"
+        elsif values.length > 1
+          raise ReificationError, "ambiguous reification of #{subject.to_base}: conflicting rdf:#{key} values #{values.map(&:to_base).join(', ')}"
+        end
+        triple[key] = values.first
+      end
+
+      [:subject, :object].each do |key|
+        term = triple[key]
+        if reification_subject?(queryable, term)
+          triple[key] = from_reified(queryable, subject: term, map: map)
+        end
+      end
+
+      statement = RDF::Statement.new(triple[:subject], triple[:predicate], triple[:object], tripleTerm: true)
+      map[statement] = subject
+      statement
+    end
+
+    ##
+    # Returns the top-level reification subjects described in `queryable`;
+    # reification subjects referenced from another reification description
+    # (i.e. nested quoted statements) are excluded.
+    #
+    # @private
+    def self.reification_subjects(queryable)
+      subjects, referenced = [], []
+      queryable.query([nil, RDF.type, RDF[:Statement]]) {|statement| subjects << statement.subject}
+      queryable.query([nil, RDF.subject, nil]) do |statement|
+        subjects << statement.subject
+        referenced << statement.object
+      end
+      queryable.query([nil, RDF.object, nil]) {|statement| referenced << statement.object}
+      subjects.uniq - referenced.uniq
+    end
+
+    ##
+    # Returns `true` if `term` is described by a reification in `queryable`.
+    #
+    # @private
+    def self.reification_subject?(queryable, term)
+      term.is_a?(RDF::Resource) &&
+        !!(queryable.first([term, RDF.type, RDF[:Statement]]) ||
+           queryable.first([term, RDF.subject, nil]))
     end
 
     # @return [Object]
@@ -479,22 +577,57 @@ module RDF
     ##
     # Returns a graph containing this statement in reified form.
     #
+    # Quoted (embedded) statements appearing in the subject or object
+    # position are expanded into reification descriptions of their own,
+    # referenced from the enclosing description by their reification
+    # subject. Quoting a statement does not assert it, so quoted statements
+    # are not added to the graph as statements themselves.
+    #
     # @param [RDF::Term]  subject   (nil)
     #   Subject of reification.
     # @param [RDF::Term]  id   (nil)
     #   Node identifier, when subject is anonymous
     # @param [RDF::Term]  graph_name   (nil)
     #   Note, in RDF 1.1, a graph name MUST be an {Resource}.
+    # @param [Hash{RDF::Statement => RDF::Resource}] map
+    #   Identity table mapping quoted statements to their reification
+    #   subjects. A caller-provided map is consulted and updated in place,
+    #   so batched conversions keep referring to the same reification node
+    #   for the same quoted statement.
     # @return [RDF::Graph]
     # @see    http://www.w3.org/TR/rdf-primer/#reification
-    def reified(subject: nil, id: nil, graph_name: nil)
+    # @see    Statement.from_reified
+    def reified(subject: nil, id: nil, graph_name: nil, map: nil)
+      map ||= {}
       RDF::Graph.new(graph_name: graph_name) do |graph|
-        subject = subject || RDF::Node.new(id)
-        graph << [subject, RDF.type,      RDF[:Statement]]
-        graph << [subject, RDF.subject,   self.subject]
-        graph << [subject, RDF.predicate, self.predicate]
-        graph << [subject, RDF.object,    self.object]
+        reify_into(graph, subject, id: id, map: map)
       end
+    end
+
+    ##
+    # Adds reification statements describing this statement to `graph`,
+    # recursively expanding embedded statements, and returns the
+    # reification subject used for this statement.
+    #
+    # @private
+    def reify_into(graph, subject = nil, id: nil, map: {})
+      subject ||= map[self] || RDF::Node.new(id)
+      map[self] = subject
+      graph << [subject, RDF.type,      RDF[:Statement]]
+      graph << [subject, RDF.subject,   reify_term(self.subject, graph, map)]
+      graph << [subject, RDF.predicate, self.predicate]
+      graph << [subject, RDF.object,    reify_term(self.object, graph, map)]
+      subject
+    end
+
+    ##
+    # Returns the term used to refer to `term` within a reification
+    # description: `term` itself, unless it is a quoted statement, which is
+    # expanded in place and referred to by its reification subject.
+    #
+    # @private
+    def reify_term(term, graph, map)
+      term.is_a?(RDF::Statement) ? term.reify_into(graph, map: map) : term
     end
   end
 end

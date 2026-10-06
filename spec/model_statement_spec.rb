@@ -338,6 +338,124 @@ describe RDF::Statement do
     end
   end
 
+  context "reification" do
+    let(:s1) {RDF::URI("http://example.org/s1")}
+    let(:p1) {RDF::URI("http://example.org/p1")}
+    let(:o1) {RDF::URI("http://example.org/o1")}
+    let(:quoted) {RDF::Statement(s1, p1, o1)}
+    let(:nested) {RDF::Statement(s, p, quoted)}
+
+    context "#reified" do
+      it "reifies a plain statement into four statements" do
+        graph = stmt.reified
+        expect(graph.count).to eq 4
+        reifier = graph.first([nil, RDF.type, RDF[:Statement]]).subject
+        expect(graph.first_object([reifier, RDF.subject, nil])).to eq s
+        expect(graph.first_object([reifier, RDF.predicate, nil])).to eq p
+        expect(graph.first_object([reifier, RDF.object, nil])).to eq o
+      end
+
+      it "expands nested quoted statements into reification descriptions" do
+        graph = nested.reified
+        outer = graph.first([nil, RDF.subject, s]).subject
+        inner = graph.first_object([outer, RDF.object, nil])
+        expect(inner).to be_a RDF::Node
+        expect(graph.first_object([inner, RDF.subject, nil])).to eq s1
+        expect(graph.first_object([inner, RDF.predicate, nil])).to eq p1
+        expect(graph.first_object([inner, RDF.object, nil])).to eq o1
+      end
+
+      it "does not assert quoted statements into the graph" do
+        graph = nested.reified
+        expect(graph.query([nil, p1, nil]).to_a).to be_empty
+        expect(graph.query([nil, p, nil]).to_a).to be_empty
+      end
+
+      it "reuses reification nodes from a caller-provided map across batches" do
+        map = {}
+        first = nested.reified(map: map)
+        expect(map[quoted]).to be_a RDF::Node
+        second = quoted.reified(map: map)
+        expect(second.first([nil, RDF.subject, nil]).subject).to eq map[quoted]
+        expect(first.first_object([map[nested], RDF.object, nil])).to eq map[quoted]
+      end
+
+      it "prefers an explicit subject and records it in the map" do
+        map = {}
+        reifier = RDF::URI("http://example.org/reifier")
+        graph = quoted.reified(subject: reifier, map: map)
+        expect(graph.first([nil, RDF.subject, nil]).subject).to eq reifier
+        expect(map[quoted]).to eq reifier
+      end
+    end
+
+    context ".from_reified" do
+      it "restores a plain statement" do
+        restored = RDF::Statement.from_reified(stmt.reified)
+        expect(restored.length).to eq 1
+        expect(restored.first).to eq stmt
+        expect(restored.first).to be_tripleTerm
+      end
+
+      it "restores nested quoted statements" do
+        restored = RDF::Statement.from_reified(nested.reified)
+        expect(restored.length).to eq 1
+        expect(restored.first).to eq nested
+        expect(restored.first.object).to eq quoted
+      end
+
+      it "restores a single statement for a given reification subject" do
+        graph = nested.reified
+        reifier = graph.first([nil, RDF.subject, s]).subject
+        expect(RDF::Statement.from_reified(graph, subject: reifier)).to eq nested
+      end
+
+      it "records restored statements in a caller-provided map" do
+        map = {}
+        graph = nested.reified
+        RDF::Statement.from_reified(graph, map: map)
+        expect(map[nested]).to be_a RDF::Node
+        expect(map[quoted]).to be_a RDF::Node
+      end
+
+      it "round-trips through a shared identity table" do
+        map = {}
+        graph = nested.reified(map: map)
+        RDF::Statement.from_reified(graph, map: map)
+        expect(nested.reified(map: map)).to eq graph
+      end
+
+      it "raises ReificationError for incomplete descriptions" do
+        graph = RDF::Graph.new do |g|
+          reifier = RDF::Node.new
+          g << [reifier, RDF.type, RDF[:Statement]]
+          g << [reifier, RDF.subject, s]
+          g << [reifier, RDF.predicate, p]
+        end
+        expect {RDF::Statement.from_reified(graph)}.to raise_error(RDF::Statement::ReificationError, /incomplete/)
+      end
+
+      it "raises ReificationError for conflicting descriptions" do
+        graph = RDF::Graph.new do |g|
+          reifier = RDF::Node.new
+          g << [reifier, RDF.type, RDF[:Statement]]
+          g << [reifier, RDF.subject, s]
+          g << [reifier, RDF.subject, s1]
+          g << [reifier, RDF.predicate, p]
+          g << [reifier, RDF.object, o]
+        end
+        expect {RDF::Statement.from_reified(graph)}.to raise_error(RDF::Statement::ReificationError, /ambiguous/)
+      end
+
+      it "raises ReificationError for conflicting nested descriptions" do
+        graph = nested.reified
+        inner = graph.first_object([graph.first([nil, RDF.subject, s]).subject, RDF.object, nil])
+        graph << [inner, RDF.object, RDF::URI("http://example.org/other")]
+        expect {RDF::Statement.from_reified(graph)}.to raise_error(RDF::Statement::ReificationError, /ambiguous/)
+      end
+    end
+  end
+
   context "c14n" do
     {
       RDF::Statement.new(RDF::URI("https://rubygems.org/gems/rdf"), RDF::URI("http://purl.org/dc/terms/creator"), RDF::URI("http://ar.to/#self")) =>
