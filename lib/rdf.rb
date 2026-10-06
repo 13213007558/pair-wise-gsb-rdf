@@ -53,6 +53,9 @@ module RDF
   # RDF querying
   autoload :Query,             'rdf/query'
 
+  # SHACL validation
+  autoload :SHACL,              'rdf/shacl'
+
   # RDF vocabularies
   autoload :Vocabulary,        'rdf/vocabulary'
   autoload :StrictVocabulary,  'rdf/vocabulary'

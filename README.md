@@ -133,6 +133,48 @@ Different RDF gems will augment the `rdf` script with more capabilities, which m
     require 'rdf'
     include RDF
 
+### SHACL Core subset validation
+
+`RDF::SHACL.validate` takes a shape graph and a data graph as separate arguments.
+The shape graph is compiled first; data is never used to infer which constraints exist.
+
+    report = RDF::SHACL.validate(shape_graph, data_graph)
+    report.conforms?
+    report.results.each do |result|
+      result.focus_node
+      result.result_path
+      result.value
+      result.source_shape
+      result.source_constraint
+      result.constraint_parameter
+    end
+
+Supported in this subset:
+
+* Targets: `sh:targetClass` (including `rdfs:subClassOf`) and `sh:targetNode`.
+* Paths: predicate, `sh:inversePath`, `sh:alternativePath`, RDF list sequences,
+  `sh:zeroOrMorePath`, `sh:oneOrMorePath`, and `sh:zeroOrOnePath`.
+* Cardinality: `sh:minCount` and `sh:maxCount`.
+* Value typing: `sh:datatype` and `sh:class`.
+* Logic: `sh:and`, `sh:or`, `sh:not`, and `sh:xone`.
+* Qualified shapes: `sh:qualifiedValueShape`, `sh:qualifiedMinCount`,
+  `sh:qualifiedMaxCount`, and `sh:qualifiedValueShapesDisjoint`.
+
+Recursive shapes are evaluated with an explicit `[shape, focus node]` stack
+rather than unrestricted Ruby recursion. A positive recursive edge is treated
+as satisfying the repeated requirement, which accepts finite reachable graphs
+such as transitive parent/child constraints. Recursion through an odd number of
+`sh:not` edges has no stable true/false answer for this evaluator, so it is
+reported as `:unsupportedRecursion` instead of looping or silently choosing one.
+
+Run the qualified-count example:
+
+    ruby -Ilib examples/shacl_qualified_count.rb
+
+The data has two friends but only one adult. Ordinary `sh:minCount 2` passes;
+`sh:qualifiedMinCount 2` with an adult qualified value shape fails, showing why
+qualified counts cannot be replaced by an unqualified count.
+
 ### Writing RDF data using the [N-Triples][] format
 
     require 'rdf/ntriples'
