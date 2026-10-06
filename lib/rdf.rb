@@ -53,6 +53,9 @@ module RDF
   # RDF querying
   autoload :Query,             'rdf/query'
 
+  # RDF description extraction
+  autoload :CBD,               'rdf/cbd'
+
   # RDF vocabularies
   autoload :Vocabulary,        'rdf/vocabulary'
   autoload :StrictVocabulary,  'rdf/vocabulary'

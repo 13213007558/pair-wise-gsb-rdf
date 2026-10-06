@@ -171,6 +171,34 @@ module RDF
     protected :query_pattern
 
     ##
+    # Extracts the Concise Bounded Description (CBD) of the given
+    # resource from `self`.
+    #
+    # The CBD is the complete local description of `subject`: all
+    # statements about it, the recursive description of blank-node
+    # objects, and any reifications of the included statements. URI
+    # objects are kept as references only and reported, along with
+    # undescribed blank nodes, in the result's boundary list.
+    #
+    # @example Extracting the CBD of a resource
+    #     result = repository.cbd(RDF::URI('http://example.org/s'))
+    #     result.statements # => [...]
+    #     result.boundary   # => [...]
+    #
+    # @param  [RDF::Resource] subject
+    #   the resource to describe
+    # @param  [Hash{Symbol => Object}] options
+    # @option options [RDF::Resource, false, nil] :graph_name (nil)
+    #   graph scoping semantics: `nil` considers statements in every
+    #   graph (dataset semantics), `false` only the default graph, and
+    #   any other term only that named graph
+    # @return [RDF::CBD::Result]
+    # @see    RDF::CBD.extract
+    def cbd(subject, **options)
+      RDF::CBD.extract(self, subject, **options)
+    end
+
+    ##
     # Queries `self` for an RDF statement matching the given `pattern` and
     # returns that statement if found.
     #
