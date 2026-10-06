@@ -31,15 +31,18 @@ module RDF
     #   tx.insert [RDF::URI("https://rubygems.org/gems/rdf"), RDF::RDFS.label, "RDF.rb"]
     #   tx.execute
     #
-    # @overload transaction(mutable: false)
+    # @overload transaction(mutable: false, **options)
     #   @param mutable [Boolean]
+    #   @param options [Hash{Symbol => Object}] transaction options
     #   @return [RDF::Transaction] an open transaction; the client is 
     #     responsible for closing the transaction via #execute or #rollback
     #
-    # @overload transaction(mutable: false, &block)
+    # @overload transaction(mutable: false, **options, &block)
     #   @param mutable [Boolean] 
     #     allows changes to the transaction, otherwise it is a read-only 
     #     snapshot of the underlying repository.
+    #   @param options [Hash{Symbol => Object}] transaction options, such as
+    #     `isolation: :serializable`
     #   @yield  [tx]
     #   @yieldparam  [RDF::Transaction] tx
     #   @yieldreturn [void] ignored
@@ -47,8 +50,8 @@ module RDF
     #
     # @see    RDF::Transaction
     # @since  0.3.0
-    def transaction(mutable: false, &block)
-      tx = begin_transaction(mutable: mutable)
+    def transaction(mutable: false, **options, &block)
+      tx = begin_transaction(mutable: mutable, **options)
       return tx unless block_given?
 
       begin
@@ -77,8 +80,9 @@ module RDF
     # @param mutable [Boolean] Create a mutable or immutable transaction.
     # @param graph_name [Boolean] A default graph name for statements inserted
     #   or deleted (default: nil)
+    # @param options [Hash{Symbol => Object}] transaction options
     # @return [RDF::Transaction]
-    def begin_transaction(mutable: false, graph_name: nil)
+    def begin_transaction(mutable: false, graph_name: nil, **options)
       raise NotImplementedError
     end
 

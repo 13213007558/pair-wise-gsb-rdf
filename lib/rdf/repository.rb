@@ -234,8 +234,25 @@ module RDF
       # @private
       # @see RDF::Transactable#begin_transaction
       # @since  0.3.0
-      def begin_transaction(mutable: false, graph_name: nil)
-        @tx_class.new(self, mutable: mutable, graph_name: graph_name)
+      def begin_transaction(mutable: false, graph_name: nil,
+                            isolation: nil, isolation_level: nil,
+                            serializable: nil, **options)
+        requested_isolation = isolation || isolation_level
+        requested_isolation = :serializable if serializable == true
+        tx_class = if requested_isolation == :serializable
+          RDF::Transaction::SerializedTransaction
+        elsif serializable == false ||
+              (requested_isolation && @tx_class == RDF::Transaction::SerializedTransaction)
+          RDF::Transaction
+        else
+          @tx_class
+        end
+
+        tx_class.new(self,
+                     mutable: mutable,
+                     graph_name: graph_name,
+                     isolation: requested_isolation,
+                     **options)
       end
 
     ##
@@ -255,6 +272,7 @@ module RDF
       def self.extend_object(obj)
         obj.instance_variable_set(:@data, obj.options.delete(:data) || 
                                           Hash.new)
+        obj.instance_variable_set(:@mutex, Mutex.new)
         obj.instance_variable_set(:@tx_class, 
                                   obj.options.delete(:transaction_class) || 
                                   RDF::Transaction::SerializedTransaction)
@@ -369,17 +387,19 @@ module RDF
       ##
       # @see Mutable#apply_changeset
       def apply_changeset(changeset)
-        data = @data
-        changeset.deletes.each do |del|
-          if del.constant?
-            data = delete_from(data, del)
-          else
-            # we need this condition to handle wildcard statements
-            query_pattern(del) { |stmt| data = delete_from(data, stmt) }
+        synchronize do
+          data = @data
+          changeset.deletes.each do |del|
+            if del.constant?
+              data = delete_from(data, del)
+            else
+              # we need this condition to handle wildcard statements
+              query_pattern(del) { |stmt| data = delete_from(data, stmt) }
+            end
           end
+          changeset.inserts.each { |ins| data = insert_to(data, ins) }
+          @data = data
         end
-        changeset.inserts.each { |ins| data = insert_to(data, ins) }
-        @data = data
       end
 
       ##
@@ -396,7 +416,7 @@ module RDF
       #
       # @see Mutable#snapshot
       def snapshot
-        self.class.new(data: @data).freeze
+        synchronize { self.class.new(data: @data).freeze }
       end
 
       protected
@@ -461,21 +481,25 @@ module RDF
       # @private
       # @see RDF::Mutable#insert
       def insert_statement(statement)
-        @data = insert_to(@data, statement)
+        synchronize { @data = insert_to(@data, statement) }
       end
 
       ##
       # @private
       # @see RDF::Mutable#delete
       def delete_statement(statement)
-        @data = delete_from(@data, statement)
+        synchronize { @data = delete_from(@data, statement) }
       end
 
       ##
       # @private
       # @see RDF::Mutable#clear
       def clear_statements
-        @data = @data.class.new
+        synchronize { @data = @data.class.new }
+      end
+
+      def synchronize(&block)
+        @mutex.synchronize(&block)
       end
 
       ##
@@ -492,7 +516,78 @@ module RDF
         @data = hash
       end
 
+      def changed_statements(old_data, new_data)
+        changes = { inserts: [], deletes: [] }
+        collect_changed_graphs(old_data, new_data, changes)
+        changes
+      end
+
       private
+
+      def collect_changed_graphs(old_data, new_data, changes)
+        (old_data.keys | new_data.keys).each do |graph_name|
+          old_graph = old_data[graph_name] || {}
+          new_graph = new_data[graph_name] || {}
+
+          if !old_data.key?(graph_name)
+            each_statement_path(new_graph, graph_name) { |path| add_changed_statement(changes[:inserts], path) }
+          elsif !new_data.key?(graph_name)
+            each_statement_path(old_graph, graph_name) { |path| add_changed_statement(changes[:deletes], path) }
+          else
+            collect_changed_subjects(old_graph, new_graph, graph_name, changes)
+          end
+        end
+      end
+
+      def collect_changed_subjects(old_graph, new_graph, graph_name, changes)
+        (old_graph.keys | new_graph.keys).each do |subject|
+          old_predicates = old_graph[subject] || {}
+          new_predicates = new_graph[subject] || {}
+
+          if !old_graph.key?(subject)
+            each_statement_path(new_predicates, graph_name, subject) { |path| add_changed_statement(changes[:inserts], path) }
+          elsif !new_graph.key?(subject)
+            each_statement_path(old_predicates, graph_name, subject) { |path| add_changed_statement(changes[:deletes], path) }
+          else
+            collect_changed_predicates(old_predicates, new_predicates, graph_name, subject, changes)
+          end
+        end
+      end
+
+      def collect_changed_predicates(old_predicates, new_predicates, graph_name, subject, changes)
+        (old_predicates.keys | new_predicates.keys).each do |predicate|
+          old_objects = old_predicates[predicate] || {}
+          new_objects = new_predicates[predicate] || {}
+
+          if !old_predicates.key?(predicate)
+            new_objects.each_key { |object| add_changed_statement(changes[:inserts], [graph_name, subject, predicate, object]) }
+          elsif !new_predicates.key?(predicate)
+            old_objects.each_key { |object| add_changed_statement(changes[:deletes], [graph_name, subject, predicate, object]) }
+          else
+            (old_objects.keys - new_objects.keys).each do |object|
+              add_changed_statement(changes[:deletes], [graph_name, subject, predicate, object])
+            end
+            (new_objects.keys - old_objects.keys).each do |object|
+              add_changed_statement(changes[:inserts], [graph_name, subject, predicate, object])
+            end
+          end
+        end
+      end
+
+      def each_statement_path(statements, graph_name, subject = nil, &block)
+        statements.each do |subject_or_predicate, predicates_or_objects|
+          if subject
+            predicates_or_objects.each_key { |object| block.call([graph_name, subject, subject_or_predicate, object]) }
+          else
+            each_statement_path(predicates_or_objects, graph_name, subject_or_predicate, &block)
+          end
+        end
+      end
+
+      def add_changed_statement(statements, path)
+        graph_name = path[0] == DEFAULT_GRAPH ? nil : path[0]
+        statements << RDF::Statement.new(path[1], path[2], path[3], graph_name: graph_name)
+      end
 
       ##
       # @private

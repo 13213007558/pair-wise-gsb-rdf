@@ -152,6 +152,7 @@ module RDF
     ##
     # @see RDF::Dataset#isolation_level
     def isolation_level
+      return options[:isolation] if RDF::Dataset::ISOLATION_LEVELS.include?(options[:isolation])
       return :repeatable_read if repository.supports?(:snapshots)
       :read_committed
     end
@@ -334,6 +335,8 @@ module RDF
       def initialize(*args, **options, &block)
         super(*args, **options, &block)
         @base_snapshot = @snapshot
+        @read_patterns = []
+        @write_statements = []
       end
       
       ##
@@ -341,10 +344,13 @@ module RDF
       #
       # @see Transaction#insert_statement
       def insert_statement(statement)
+        statement = process_statement(statement)
+        @changes.insert(statement)
+        @write_statements << statement
         @snapshot = @snapshot.class
           .new(data: @snapshot.send(:insert_to, 
                                     @snapshot.send(:data), 
-                                    process_statement(statement)))
+                                    statement))
       end
 
       ##
@@ -352,11 +358,31 @@ module RDF
       #
       # @see Transaction#insert_statement
       def delete_statement(statement)
+        statement = process_statement(statement)
+        @changes.delete(statement)
+        @write_statements << statement
         @snapshot = @snapshot.class
           .new(data: @snapshot.send(:delete_from, 
                                     @snapshot.send(:data), 
-                                    process_statement(statement)))
+                                    statement))
       end
+
+      def each(*args, &block)
+        return enum_for(:each, *args) unless block_given?
+
+        track_read_pattern(full_read_pattern) { super(*args, &block) }
+      end
+
+      def statement?(*args)
+        case args.length
+        when 0 then false
+        when 1
+          pattern = RDF::Query::Pattern.from(args.first)
+          track_read_pattern(pattern) { super }
+        else raise ArgumentError("wrong number of arguments (given #{args.length}, expected 0 or 1)")
+        end
+      end
+      alias_method :has_statement?, :statement?
 
       ##
       # @see RDF::Dataset#isolation_level
@@ -371,29 +397,144 @@ module RDF
       def mutated?
         !@snapshot.send(:data).equal?(repository.send(:data))
       end
+
+      def rollback
+        @snapshot = @base_snapshot
+        @read_patterns.clear
+        @write_statements.clear
+        super
+      end
       
       ##
       # Replaces repository data with the transaction's snapshot in a safely 
       # serializable fashion.
       # 
-      # @note this transaction uses a pessimistic merge strategy which 
-      #   fails the transaction if any data has changed in the repository
-      #   since transaction start time. However, the specific guarantee is 
-      #   softer: multiple concurrent conflicting transactions will not 
-      #   succeed. We may choose to implement a less pessimistic merge 
-      #   strategy as a non-breaking change.
+      # Validates write intents and every read predicate against changes
+      # committed after this transaction's snapshot was taken. Unrelated
+      # updates are merged without rejecting the transaction.
       # 
-      # @raise [TransactionError] when the transaction can't be merged.
+      # @raise [ConflictError] when the transaction can't be serialized.
       # @see Transaction#execute
       def execute
         raise TransactionError, 'Cannot execute a rolled back transaction. ' \
                                 'Open a new one instead.' if instance_variable_defined?(:@rolledback) && @rolledback
 
-        raise TransactionError, 'Error merging transaction. Repository' \
-                                'has changed during transaction time.' unless 
-          repository.send(:data).equal? @base_snapshot.send(:data)
+        repository.send(:synchronize) do
+          base_data    = @base_snapshot.send(:data)
+          current_data = repository.send(:data)
+          working_data = @snapshot.send(:data)
 
-        repository.send(:data=, @snapshot.send(:data))
+          unless current_data.equal?(working_data)
+            committed_changes = repository.send(:changed_statements, base_data, current_data)
+            transaction_changes = repository.send(:changed_statements, base_data, working_data)
+
+            validate_write_set(committed_changes)
+            validate_read_set(committed_changes)
+
+            repository.send(:data=, merge_changes(current_data, transaction_changes))
+          end
+        end
+
+        true
+      end
+
+      protected
+
+      def query_pattern(pattern, **options, &block)
+        pattern = scoped_read_pattern(pattern)
+
+        unless block_given?
+          return Enumerator.new do |yielder|
+            track_read_pattern(pattern) do
+              read_target.send(:query_pattern, pattern, **options) { |statement| yielder << statement }
+            end
+          end
+        end
+
+        track_read_pattern(pattern) { super(pattern, **options, &block) }
+      end
+
+      private
+
+      def full_read_pattern
+        pattern = RDF::Query::Pattern.new
+        pattern.graph_name = graph_name unless graph_name.nil?
+        pattern
+      end
+
+      def scoped_read_pattern(pattern)
+        pattern = pattern.dup
+        if !graph_name.nil? &&
+           (pattern.graph_name.nil? || pattern.graph_name.is_a?(RDF::Query::Variable))
+          pattern.graph_name = graph_name
+        end
+        pattern.freeze
+      end
+
+      def track_read_pattern(pattern)
+        pattern = scoped_read_pattern(pattern)
+        @read_patterns << pattern
+        yield if block_given?
+      end
+
+      def validate_write_set(changes)
+        committed = changes[:inserts] + changes[:deletes]
+        write_set = @write_statements +
+          repository.send(:changed_statements, @base_snapshot.send(:data), @snapshot.send(:data)).values.flatten
+
+        write_set.uniq.each do |statement|
+          conflicting = committed.find { |committed_statement| committed_statement.eql?(statement) }
+          next unless conflicting
+
+          raise_conflict(:write_conflict,
+                          pattern: RDF::Query::Pattern.from(conflicting),
+                          statement: conflicting)
+        end
+      end
+
+      def validate_read_set(changes)
+        changes[:inserts].each do |statement|
+          pattern = @read_patterns.find { |read_pattern| read_pattern_matches?(read_pattern, statement) }
+          raise_conflict(:phantom_read, pattern: pattern, statement: statement) if pattern
+        end
+
+        changes[:deletes].each do |statement|
+          pattern = @read_patterns.find { |read_pattern| read_pattern_matches?(read_pattern, statement) }
+          raise_conflict(:write_skew, pattern: pattern, statement: statement) if pattern
+        end
+      end
+
+      def read_pattern_matches?(pattern, statement)
+        graph_matches = case pattern.graph_name
+        when nil then true
+        when false then statement.graph_name.nil?
+        when RDF::Query::Variable then statement.graph_name?
+        else pattern.graph_name.eql?(statement.graph_name)
+        end
+
+        return false unless graph_matches
+
+        ungraphed_pattern = pattern.dup
+        ungraphed_pattern.graph_name = nil
+        ungraphed_pattern === statement
+      end
+
+      def merge_changes(current_data, changes)
+        merged_data = current_data
+        changes[:deletes].each do |statement|
+          merged_data = repository.send(:delete_from, merged_data, statement)
+        end
+        changes[:inserts].each do |statement|
+          merged_data = repository.send(:insert_to, merged_data, statement)
+        end
+        merged_data
+      end
+
+      def raise_conflict(conflict_type, pattern:, statement:)
+        raise ConflictError.new(conflict_type,
+                                pattern: pattern,
+                                statement: statement,
+                                repository: repository)
       end
     end # SerializedTransaction
 
@@ -403,5 +544,22 @@ module RDF
     # This error indicates that the transaction semantics have been violated in 
     # some way.
     class TransactionError < RuntimeError; end
+
+    ##
+    # Raised when a serializable transaction cannot be committed without
+    # violating its snapshot or write intents.
+    class ConflictError < TransactionError
+      attr_reader :conflict_type, :pattern, :statement
+
+      def initialize(conflict_type, pattern:, statement:, repository: nil)
+        @conflict_type = conflict_type
+        @pattern = pattern
+        @statement = statement
+        super("Unable to serialize transaction against #{repository.class}: " \
+              "#{conflict_type} matches #{pattern.inspect}")
+      end
+
+      alias type conflict_type
+    end
   end # Transaction
 end # RDF
