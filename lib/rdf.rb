@@ -48,6 +48,7 @@ module RDF
   autoload :Changeset,         'rdf/changeset'
   autoload :Dataset,           'rdf/model/dataset'
   autoload :Repository,        'rdf/repository'
+  autoload :TemporalRepository, 'rdf/temporal_repository'
   autoload :Transaction,       'rdf/transaction'
 
   # RDF querying

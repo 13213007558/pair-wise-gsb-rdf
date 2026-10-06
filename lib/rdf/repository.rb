@@ -154,7 +154,13 @@ module RDF
       @title   = title
 
       # Provide a default in-memory implementation:
-      send(:extend, Implementation) if self.class.equal?(RDF::Repository)
+      temporal = @options.delete(:temporal)
+      require 'rdf/temporal_repository' if temporal
+      if temporal
+        send(:extend, RDF::Repository::TemporalImplementation)
+      elsif self.class.equal?(RDF::Repository)
+        send(:extend, Implementation)
+      end
 
       @tx_class ||= @options.delete(:transaction_class) { DEFAULT_TX_CLASS }
 
