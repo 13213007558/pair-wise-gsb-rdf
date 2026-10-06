@@ -302,6 +302,156 @@ module RDF
     end
 
     ##
+    # The result of extracting a Concise Bounded Description (CBD) from a
+    # queryable, see {RDF::Queryable#concise_bounded_description}.
+    #
+    # Behaves as an enumerable over the extracted {#statements}, which
+    # retain their `graph_name` so that graph provenance is preserved when
+    # the description spans multiple named graphs.
+    class ConciseBoundedDescription
+      include ::Enumerable
+
+      ##
+      # @return [RDF::Resource] the described resource
+      attr_reader :subject
+
+      ##
+      # @return [Array<RDF::Statement>] statements forming the description
+      attr_reader :statements
+
+      ##
+      # @return [Array<RDF::URI>] resources referenced by, but not included
+      #   in, the description
+      attr_reader :references
+
+      ##
+      # @param  [RDF::Resource]          subject
+      # @param  [Array<RDF::Statement>]  statements
+      # @param  [Array<RDF::URI>]        references
+      def initialize(subject, statements, references)
+        @subject    = subject
+        @statements = statements.freeze
+        @references = references.freeze
+      end
+
+      ##
+      # Enumerates the statements of the description.
+      #
+      # @yield  [statement]
+      # @yieldparam [RDF::Statement] statement
+      # @return [Enumerator<RDF::Statement>]
+      def each(&block)
+        return enum_for(:each) unless block_given?
+        statements.each(&block)
+      end
+
+      ##
+      # @return [Boolean] `true` if the description contains no statements
+      def empty?
+        statements.empty?
+      end
+    end # ConciseBoundedDescription
+
+    ##
+    # Extracts a Concise Bounded Description (CBD) of `subject`, suitable
+    # for handing the complete local description of a resource to another
+    # service.
+    #
+    # The description contains:
+    #
+    # * All statements having `subject` as their subject.
+    # * Recursively, all statements describing blank nodes which are the
+    #   object of a statement already in the description. Blank node cycles
+    #   (including blank nodes shared by several statements) are expanded
+    #   only once, so extraction always terminates.
+    # * Recursively, all reifications of statements in the description:
+    #   every node `r` such that `r rdf:subject s`, `r rdf:predicate p`,
+    #   and `r rdf:object o` for an included statement `(s, p, o)` is
+    #   itself described by all statements having `r` as their subject.
+    #
+    # Ordinary URI objects are not expanded; they are reported in
+    # {ConciseBoundedDescription#references} so the caller knows which
+    # resources were left outside the boundary.
+    #
+    # With multiple named graphs, the caller chooses the semantics through
+    # `graph_name`: `nil` (the default) applies dataset semantics and spans
+    # all graphs, `false` restricts extraction to the default graph, and a
+    # resource restricts it to that named graph. Either way, the returned
+    # statements keep their original `graph_name`.
+    #
+    # @example Extracting the CBD of a resource from a repository
+    #     cbd = repository.concise_bounded_description(RDF::URI("http://example.org/s"))
+    #     cbd.statements  #=> Array<RDF::Statement>
+    #     cbd.references  #=> Array<RDF::URI>
+    #
+    # @param  [RDF::Resource] subject
+    #   the resource to describe
+    # @param  [RDF::Resource, nil, false] graph_name (nil)
+    #   `nil` for dataset semantics (all graphs), `false` for the default
+    #   graph only, or a resource for a single named graph
+    # @return [RDF::Queryable::ConciseBoundedDescription]
+    # @see    https://www.w3.org/Submission/2004/SUBM-CBD-20040930/
+    def concise_bounded_description(subject, graph_name: nil)
+      statements    = []
+      included      = {} # statements already in the description
+      references    = []
+      referenced    = {} # URI objects already reported as references
+      expanded      = {} # subjects whose statements have been extracted
+      frontier      = [subject]
+      pending       = [] # extracted statements awaiting closure processing
+
+      append = lambda do |statement|
+        unless included[statement]
+          included[statement] = true
+          statements << statement
+          pending << statement
+        end
+      end
+
+      until frontier.empty? && pending.empty?
+        until frontier.empty?
+          node = frontier.shift
+          next if expanded[node]
+          expanded[node] = true
+          query({subject: node, graph_name: graph_name}, &append)
+        end
+
+        until pending.empty?
+          statement = pending.shift
+          object = statement.object
+          case
+          when object.is_a?(RDF::Node)
+            frontier << object unless expanded[object]
+          when object.uri?
+            unless referenced[object]
+              referenced[object] = true
+              references << object
+            end
+          end
+
+          # Reification closure: expand every node reifying this statement.
+          query({predicate: RDF.subject, object: statement.subject, graph_name: graph_name}) do |reification|
+            reifier = reification.subject
+            next if expanded[reifier]
+            about = query({subject: reifier, graph_name: graph_name}).to_a
+            next unless about.any? {|st| st.predicate.eql?(RDF.predicate) && st.object.eql?(statement.predicate)} &&
+                        about.any? {|st| st.predicate.eql?(RDF.object) && st.object.eql?(statement.object)}
+            expanded[reifier] = true
+            about.each(&append)
+          end
+        end
+      end
+
+      # Resources that ended up being described (e.g. the root subject,
+      # or a URI reifying an included statement) are not boundary
+      # references.
+      references.reject! {|uri| expanded[uri]}
+
+      ConciseBoundedDescription.new(subject, statements, references)
+    end
+    alias_method :cbd, :concise_bounded_description
+
+    ##
     # @private
     # @param  [Symbol, #to_sym] method
     # @return [Enumerator<RDF::Statement, RDF::Query::Pattern>]
