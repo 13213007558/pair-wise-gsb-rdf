@@ -330,21 +330,82 @@ module RDF
     # @see RDF::Transaction
     class SerializedTransaction < Transaction
       ##
+      # @return [Array<RDF::Query::Pattern>]
+      attr_reader :read_set
+
+      ##
+      # @return [Array<Array(Symbol, RDF::Statement)>]
+      attr_reader :write_set
+
+      ##
       # @see Transaction#initialize
       def initialize(*args, **options, &block)
         super(*args, **options, &block)
         @base_snapshot = @snapshot
+        @read_set = []
+        @write_set = []
       end
-      
+
+      ##
+      # Records simple patterns and BGP queries before they are evaluated.
+      #
+      # @see RDF::Queryable#query
+      def before_query(query, graph_name: nil, name: nil, **_options)
+        case query
+        when RDF::Query
+          graph_name ||= name || query.graph_name
+          query.patterns.each do |pattern|
+            pattern = pattern.dup
+            pattern.graph_name = graph_name if pattern.graph_name.nil? && !graph_name.nil?
+            track_read(pattern)
+          end
+        else
+          track_read(RDF::Query::Pattern.from(query))
+        end
+      end
+
+      ##
+      # @see RDF::Transaction#statement?
+      def statement?(*args)
+        if args.length == 1 && args.first
+          track_read(RDF::Query::Pattern.from(args.first))
+        end
+        super
+      end
+      alias_method :has_statement?, :statement?
+      alias_method :include?, :statement?
+
+      ##
+      # @see RDF::Enumerable#each_statement
+      def each(*args, &block)
+        track_read(RDF::Query::Pattern.new)
+        super
+      end
+      alias_method :each_statement, :each
+
+      def query_pattern(pattern, *args, &block)
+        track_read(pattern)
+        super
+      end
+
+      def query_execute(query, **options, &block)
+        before_query(query, **options)
+        super
+      end
+      protected :query_pattern, :query_execute
+
       ##
       # Inserts the statement to the transaction's working snapshot.
       #
       # @see Transaction#insert_statement
       def insert_statement(statement)
+        statement = process_statement(statement)
+        @changes.insert(statement)
+        @write_set << [:insert, statement]
         @snapshot = @snapshot.class
           .new(data: @snapshot.send(:insert_to, 
                                     @snapshot.send(:data), 
-                                    process_statement(statement)))
+                                    snapshot_statement(statement)))
       end
 
       ##
@@ -352,10 +413,13 @@ module RDF
       #
       # @see Transaction#insert_statement
       def delete_statement(statement)
+        statement = process_statement(statement)
+        @changes.delete(statement)
+        @write_set << [:delete, statement]
         @snapshot = @snapshot.class
           .new(data: @snapshot.send(:delete_from, 
                                     @snapshot.send(:data), 
-                                    process_statement(statement)))
+                                    snapshot_statement(statement)))
       end
 
       ##
@@ -363,7 +427,7 @@ module RDF
       def isolation_level
         :serializable
       end
-      
+
       ##
       # @note this is a simple object equality check.
       # 
@@ -371,29 +435,65 @@ module RDF
       def mutated?
         !@snapshot.send(:data).equal?(repository.send(:data))
       end
-      
+
       ##
-      # Replaces repository data with the transaction's snapshot in a safely 
-      # serializable fashion.
-      # 
-      # @note this transaction uses a pessimistic merge strategy which 
-      #   fails the transaction if any data has changed in the repository
-      #   since transaction start time. However, the specific guarantee is 
-      #   softer: multiple concurrent conflicting transactions will not 
-      #   succeed. We may choose to implement a less pessimistic merge 
-      #   strategy as a non-breaking change.
-      # 
-      # @raise [TransactionError] when the transaction can't be merged.
+      # Validates the transaction's read and write sets before publishing its
+      # snapshot. Disjoint writes do not conflict; matching reads and writes do.
+      #
+      # @raise [Transaction::SerializationError] when serialization fails
       # @see Transaction#execute
       def execute
         raise TransactionError, 'Cannot execute a rolled back transaction. ' \
                                 'Open a new one instead.' if instance_variable_defined?(:@rolledback) && @rolledback
 
-        raise TransactionError, 'Error merging transaction. Repository' \
-                                'has changed during transaction time.' unless 
-          repository.send(:data).equal? @base_snapshot.send(:data)
+        return true unless mutable?
 
-        repository.send(:data=, @snapshot.send(:data))
+        repository.serializable_commit(self)
+      end
+
+      ##
+      # @return [Object] the immutable data captured when the transaction began
+      # @api private
+      def base_data
+        @base_snapshot.send(:data)
+      end
+
+      ##
+      # @return [Object] the transaction's working data
+      # @api private
+      def snapshot_data
+        @snapshot.send(:data)
+      end
+
+      ##
+      # @see Transaction#rollback
+      def rollback
+        super
+        @snapshot = @base_snapshot
+        @read_set = []
+        @write_set = []
+        true
+      end
+
+      ##
+      private
+
+      def track_read(pattern)
+        return unless mutable?
+
+        pattern = RDF::Query::Pattern.from(pattern).dup
+
+        if !graph_name.nil? && pattern.graph_name.nil?
+          pattern.graph_name = graph_name
+        end
+
+        @read_set << pattern unless @read_set.any? { |existing| existing.eql?(pattern) }
+      end
+
+      def snapshot_statement(statement)
+        statement = statement.dup
+        statement.graph_name = false if statement.graph_name.nil?
+        statement
       end
     end # SerializedTransaction
 
@@ -403,5 +503,22 @@ module RDF
     # This error indicates that the transaction semantics have been violated in 
     # some way.
     class TransactionError < RuntimeError; end
+
+    ##
+    # Raised when a serializable transaction cannot be serialized.
+    class SerializationError < TransactionError
+      TYPES = [:write, :read, :phantom].freeze
+
+      ##
+      # @return [Array<Hash{Symbol => Object}>]
+      attr_reader :conflicts
+
+      ##
+      # @param conflicts [Array<Hash{Symbol => Object}>]
+      def initialize(conflicts)
+        @conflicts = conflicts
+        super('Unable to serialize transaction')
+      end
+    end
   end # Transaction
 end # RDF

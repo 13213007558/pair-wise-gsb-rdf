@@ -253,8 +253,8 @@ module RDF
       ##
       # @private
       def self.extend_object(obj)
-        obj.instance_variable_set(:@data, obj.options.delete(:data) || 
-                                          Hash.new)
+        obj.instance_variable_set(:@data, obj.options.delete(:data) || Hash.new)
+        obj.instance_variable_set(:@transaction_mutex, Mutex.new)
         obj.instance_variable_set(:@tx_class, 
                                   obj.options.delete(:transaction_class) || 
                                   RDF::Transaction::SerializedTransaction)
@@ -369,23 +369,25 @@ module RDF
       ##
       # @see Mutable#apply_changeset
       def apply_changeset(changeset)
-        data = @data
-        changeset.deletes.each do |del|
-          if del.constant?
-            data = delete_from(data, del)
-          else
-            # we need this condition to handle wildcard statements
-            query_pattern(del) { |stmt| data = delete_from(data, stmt) }
+        synchronize do
+          data = @data
+          changeset.deletes.each do |del|
+            if del.constant?
+              data = delete_from(data, del)
+            else
+              # we need this condition to handle wildcard statements
+              query_pattern(del) { |stmt| data = delete_from(data, stmt) }
+            end
           end
+          changeset.inserts.each { |ins| data = insert_to(data, ins) }
+          @data = data
         end
-        changeset.inserts.each { |ins| data = insert_to(data, ins) }
-        @data = data
       end
 
       ##
       # @see RDF::Dataset#isolation_level
       def isolation_level
-        :snapshot
+        :serializable
       end
 
       ##
@@ -397,6 +399,23 @@ module RDF
       # @see Mutable#snapshot
       def snapshot
         self.class.new(data: @data).freeze
+      end
+
+      ##
+      # Validates and publishes a {RDF::Transaction::SerializedTransaction}.
+      #
+      # @return [Boolean]
+      # @api private
+      def serializable_commit(transaction)
+        synchronize do
+          conflicts = transaction_conflicts(transaction)
+          raise RDF::Transaction::SerializationError, conflicts unless conflicts.empty?
+
+          transaction_changes(transaction).each do |action, statement|
+            @data = action == :delete ? delete_from(@data, statement) : insert_to(@data, statement)
+          end
+        end
+        true
       end
 
       protected
@@ -461,21 +480,21 @@ module RDF
       # @private
       # @see RDF::Mutable#insert
       def insert_statement(statement)
-        @data = insert_to(@data, statement)
+        synchronize { @data = insert_to(@data, statement) }
       end
 
       ##
       # @private
       # @see RDF::Mutable#delete
       def delete_statement(statement)
-        @data = delete_from(@data, statement)
+        synchronize { @data = delete_from(@data, statement) }
       end
 
       ##
       # @private
       # @see RDF::Mutable#clear
       def clear_statements
-        @data = @data.class.new
+        synchronize { @data = @data.class.new }
       end
 
       ##
@@ -494,17 +513,96 @@ module RDF
 
       private
 
+      def synchronize(&block)
+        @transaction_mutex.synchronize(&block)
+      end
+
+      def transaction_conflicts(transaction)
+        committed = statement_diff(transaction.base_data, @data)
+        base_statements = statements_from_data(transaction.base_data)
+        conflicts = []
+
+        written_statements = transaction.write_set.map(&:last).uniq
+
+        written_statements.each do |local_statement|
+          if committed.any? { |_, committed_statement|
+               committed_statement.eql?(local_statement)
+             }
+            conflicts << conflict(:write, RDF::Query::Pattern.from(local_statement), local_statement)
+          end
+        end
+
+        transaction.read_set.each do |pattern|
+          committed.each do |action, committed_statement|
+            next unless pattern === committed_statement
+
+            if action == :insert
+              base_matches = base_statements.any? { |statement| pattern === statement }
+              conflict_type = base_matches ? :read : :phantom
+              conflicts << conflict(conflict_type, pattern, committed_statement)
+            else
+              conflicts << conflict(:read, pattern, committed_statement)
+            end
+          end
+        end
+
+        conflicts.uniq { |entry| [entry[:type], entry[:pattern], entry[:statement]] }
+      end
+
+      def conflict(type, pattern, statement)
+        { type: type, pattern: pattern, statement: statement }
+      end
+
+      def transaction_changes(transaction)
+        statement_diff(transaction.base_data, transaction.snapshot_data)
+      end
+
+      def statement_diff(old_data, new_data)
+        old_statements = statements_from_data(old_data)
+        new_statements = statements_from_data(new_data)
+
+        old_statements.each_with_object([]) do |statement, diff|
+          diff << [:delete, statement] unless new_statements.any? { |candidate| candidate.eql?(statement) }
+        end.concat(new_statements.each_with_object([]) do |statement, diff|
+          diff << [:insert, statement] unless old_statements.any? { |candidate| candidate.eql?(statement) }
+        end)
+      end
+
+      def statements_from_data(data)
+        return [] if data.nil?
+
+        data.each_with_object([]) do |(graph_name, subjects), statements|
+          subjects.each do |subject, predicates|
+            predicates.each do |predicate, objects|
+              objects.each do |object, object_options|
+                statements << RDF::Statement.new(
+                  subject,
+                  predicate,
+                  object,
+                  object_options.merge(graph_name: graph_name.equal?(DEFAULT_GRAPH) ? nil : graph_name)
+                )
+              end
+            end
+          end
+        end
+      end
+
       ##
       # @private
       # @see #statement?
       def statement_in?(data, statement)
         s, p, o, g = statement.to_quad
-        g ||= DEFAULT_GRAPH
+        graph_name = supports?(:graph_name) ? index_key(data, g || DEFAULT_GRAPH) : DEFAULT_GRAPH
+        return false unless data.key?(graph_name)
 
-        data.key?(g) &&
-          data[g].key?(s) &&
-          data[g][s].key?(p) &&
-          data[g][s][p].key?(o)
+        subject_name = index_key(data[graph_name], s)
+        return false unless subject_name
+
+        predicate_name = data[graph_name][subject_name].key?(p) ? p : nil
+        return false unless predicate_name
+
+        objects = data[graph_name][subject_name][predicate_name]
+        objects.key?(o) || objects.keys.any? { |object_name| object_name.eql?(o) }
       end
       alias_method :has_statement_in?, :statement_in?
 
@@ -532,15 +630,30 @@ module RDF
       def delete_from(data, statement)
         if has_statement_in?(data, statement)
           s, p, o, g = statement.to_quad
-          g = DEFAULT_GRAPH unless supports?(:graph_name)
-          g ||= DEFAULT_GRAPH
+          graph_name = supports?(:graph_name) ? index_key(data, g || DEFAULT_GRAPH) : DEFAULT_GRAPH
+          subject_name = index_key(data[graph_name], s)
+          predicate_name = data[graph_name][subject_name].key?(p) ? p : index_key(data[graph_name][subject_name], p)
+          object_name = data[graph_name][subject_name][predicate_name].key?(o) ? o : index_key(data[graph_name][subject_name][predicate_name], o)
 
-          os   = data[g][s][p].dup.delete_if {|k,v| k == o}
-          ps   = os.empty? ? data[g][s].dup.delete_if {|k,v| k == p} : data[g][s].merge(p => os)
-          ss   = ps.empty? ? data[g].dup.delete_if    {|k,v| k == s} : data[g].merge(s => ps)
-          return ss.empty? ? data.dup.delete_if       {|k,v| k == g} : data.merge(g => ss)
+          objects    = data[graph_name][subject_name][predicate_name].dup.delete_if { |object_key, _| object_key.eql?(object_name) }
+          predicates = if objects.empty?
+                          data[graph_name][subject_name].dup.delete_if { |predicate_key, _| predicate_key.eql?(predicate_name) }
+                        else
+                          data[graph_name][subject_name].merge(predicate_name => objects)
+                        end
+          subjects   = if predicates.empty?
+                          data[graph_name].dup.delete_if { |subject_key, _| subject_key.eql?(subject_name) }
+                        else
+                          data[graph_name].merge(subject_name => predicates)
+                        end
+          return subjects.empty? ? data.dup.delete_if { |graph_key, _| graph_key.eql?(graph_name) } : data.merge(graph_name => subjects)
         end
         data
+      end
+
+      def index_key(hash, key)
+        return key if hash.key?(key)
+        hash.keys.detect { |existing_key| existing_key.eql?(key) }
       end
     end # Implementation
   end # Repository
