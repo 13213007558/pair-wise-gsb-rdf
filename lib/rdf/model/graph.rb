@@ -309,6 +309,130 @@ module RDF
     end
 
     ##
+    # Returns a graph in which embedded (quoted) statements have been
+    # replaced by reification nodes described using plain RDF reification,
+    # for interoperability with systems not supporting quoted statements.
+    #
+    # Nested quoted statements are expanded recursively, so that every
+    # quoted statement is described by its own reification node. As
+    # quoting a statement does not assert it, quoted statements are not
+    # added to the resulting graph as facts; only the reification
+    # statements describing them are.
+    #
+    # @param [Hash{RDF::Statement => RDF::Resource}] map   (nil)
+    #   Identity table mapping quoted statements to their reification
+    #   nodes. Existing entries are reused, and new entries are added, so
+    #   that a caller-provided table can be shared across multiple
+    #   conversions to keep node identity stable.
+    # @return [RDF::Graph]
+    # @see RDF::Statement#reified
+    # @see #dereified
+    def reified(map: nil)
+      map ||= {}
+      graph = RDF::Graph.new(graph_name: graph_name, data: RDF::Repository.new)
+      each_statement do |statement|
+        subject = statement.subject
+        object  = statement.object
+        if subject.is_a?(RDF::Statement)
+          graph.insert_statements(subject.reified(map: map))
+          subject = map[subject]
+        end
+        if object.is_a?(RDF::Statement)
+          graph.insert_statements(object.reified(map: map))
+          object = map[object]
+        end
+        graph << RDF::Statement.new(subject, statement.predicate, object, graph_name: statement.graph_name)
+      end
+      graph
+    end
+
+    ##
+    # Returns a graph in which reification statements (as produced by
+    # {RDF::Graph#reified}) have been collapsed back into embedded
+    # (quoted) statements, replacing every reference to each reification
+    # node.
+    #
+    # A reification node is any resource described by an rdf:subject,
+    # rdf:predicate, or rdf:object statement, or typed as rdf:Statement.
+    # Each such resource must be described by exactly one rdf:subject,
+    # rdf:predicate, and rdf:object value; incomplete or contradictory
+    # descriptions are ambiguous and raise
+    # {RDF::Statement::AmbiguousReification} rather than picking an
+    # arbitrary value. Nested descriptions (a reification node described
+    # in terms of another reification node) are resolved recursively.
+    #
+    # @param [Hash{RDF::Statement => RDF::Resource}] map   (nil)
+    #   Identity table mapping quoted statements to their reification
+    #   nodes. Existing entries are preserved, and entries recovered from
+    #   the graph are added, so that a caller-provided table can be shared
+    #   across multiple conversions to keep node identity stable.
+    # @return [RDF::Graph]
+    # @raise [RDF::Statement::AmbiguousReification]
+    #   if a reification node has an incomplete or contradictory
+    #   description, or descriptions are cyclic.
+    # @see #reified
+    def dereified(map: nil)
+      map ||= {}
+      # Canonical key for reification nodes, as blank nodes only compare
+      # equal when identical, so they cannot be used as hash keys directly.
+      term_key = lambda {|term| term.is_a?(RDF::Node) ? term.id : term}
+      descriptions = {}
+      each_statement do |statement|
+        key = case statement.predicate
+        when RDF.subject   then :subject
+        when RDF.predicate then :predicate
+        when RDF.object    then :object
+        when RDF.type      then :typed if statement.object == RDF[:Statement]
+        end
+        next unless key
+        desc = (descriptions[term_key.call(statement.subject)] ||=
+          {term: statement.subject, subject: [], predicate: [], object: [], typed: false})
+        key == :typed ? desc[:typed] = true : desc[key] << statement.object
+      end
+
+      # Resolve each reification node to the statement it describes,
+      # recursively resolving nested reification nodes.
+      resolved = {}
+      resolve = lambda do |node, resolving|
+        key = term_key.call(node)
+        return resolved[key] if resolved.key?(key)
+        desc = descriptions[key]
+        return node unless desc
+        if resolving.include?(key)
+          raise RDF::Statement::AmbiguousReification,
+            "cyclic reification description for #{node}"
+        end
+        unless desc[:subject].length == 1 && desc[:predicate].length == 1 && desc[:object].length == 1
+          raise RDF::Statement::AmbiguousReification,
+            "incomplete or contradictory reification description for #{node}"
+        end
+        resolving = resolving + [key]
+        statement = RDF::Statement.new(
+          resolve.call(desc[:subject].first, resolving),
+          desc[:predicate].first,
+          resolve.call(desc[:object].first, resolving),
+          tripleTerm: true)
+        resolved[key] = statement
+        map[statement] ||= desc[:term]
+        statement
+      end
+      descriptions.each_key {|key| resolve.call(key, [])}
+
+      graph = RDF::Graph.new(graph_name: graph_name, data: RDF::Repository.new)
+      each_statement do |statement|
+        # Skip the reification statements themselves.
+        next if descriptions.key?(term_key.call(statement.subject)) &&
+          [RDF.subject, RDF.predicate, RDF.object].include?(statement.predicate)
+        next if descriptions.key?(term_key.call(statement.subject)) &&
+          statement.predicate == RDF.type && statement.object == RDF[:Statement]
+        subject = resolved.fetch(term_key.call(statement.subject), statement.subject)
+        object  = resolved.fetch(term_key.call(statement.object), statement.object)
+        graph << RDF::Statement.new(subject, statement.predicate, object, graph_name: statement.graph_name)
+      end
+      graph
+    end
+
+    ##
     # Graph equivalence based on the contents of each graph being _exactly_
     # the same. To determine if the have the same _meaning_, consider
     # [rdf-isomorphic](https://rubygems.org/gems/rdf-isomorphic).

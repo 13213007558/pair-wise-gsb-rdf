@@ -238,4 +238,136 @@ describe RDF::Graph do
       expect(graph).not_to be_empty
     end
   end
+
+  context "#reified" do
+    let(:ex) {RDF::Vocabulary.new("http://example.org/")}
+    let(:quoted) {RDF::Statement(ex.a, ex.b, ex.c, tripleTerm: true)}
+    let(:graph) do
+      g = described_class.new
+      g << RDF::Statement(ex.s, ex.p, quoted)
+      g
+    end
+
+    it "replaces quoted statements with reification nodes" do
+      reified = graph.reified
+      node = reified.first_object(RDF::Statement(ex.s, ex.p, nil))
+      expect(node).to be_a_node
+      expect(reified.statement?(RDF::Statement(node, RDF.type, RDF[:Statement]))).to be true
+      expect(reified.statement?(RDF::Statement(node, RDF.subject, ex.a))).to be true
+      expect(reified.statement?(RDF::Statement(node, RDF.predicate, ex.b))).to be true
+      expect(reified.statement?(RDF::Statement(node, RDF.object, ex.c))).to be true
+    end
+
+    it "does not assert quoted statements" do
+      expect(graph.reified.statement?(RDF::Statement(ex.a, ex.b, ex.c))).to be false
+    end
+
+    it "leaves plain statements untouched" do
+      graph << RDF::Statement(ex.s, ex.q, ex.o)
+      expect(graph.reified.statement?(RDF::Statement(ex.s, ex.q, ex.o))).to be true
+    end
+
+    it "expands nested quoted statements into controlled reification nodes" do
+      nested = RDF::Statement(ex.x, ex.y, quoted, tripleTerm: true)
+      graph << RDF::Statement(ex.s, ex.q, nested)
+      reified = graph.reified
+      reified.each_statement do |st|
+        expect(st.object).not_to be_a_statement
+      end
+      inner_node = reified.first_object(RDF::Statement(ex.s, ex.p, nil))
+      outer_node = reified.first_object(RDF::Statement(ex.s, ex.q, nil))
+      expect(reified.first_object(RDF::Statement(outer_node, RDF.object, nil))).to eq inner_node
+    end
+
+    it "shares a caller-provided identity table across batches" do
+      map = {}
+      graph.reified(map: map)
+      other = described_class.new
+      other << RDF::Statement(ex.s2, ex.p, quoted)
+      reified = other.reified(map: map)
+      expect(reified.first_object(RDF::Statement(ex.s2, ex.p, nil))).to eq map[quoted]
+    end
+
+    it "round-trips through #dereified" do
+      expect(graph.reified.dereified).to eq graph
+    end
+  end
+
+  context "#dereified" do
+    let(:ex) {RDF::Vocabulary.new("http://example.org/")}
+    let(:node) {RDF::Node.new}
+    let(:graph) do
+      g = described_class.new
+      g << RDF::Statement(node, RDF.type, RDF[:Statement])
+      g << RDF::Statement(node, RDF.subject, ex.a)
+      g << RDF::Statement(node, RDF.predicate, ex.b)
+      g << RDF::Statement(node, RDF.object, ex.c)
+      g
+    end
+
+    it "restores quoted statements from reification descriptions" do
+      graph << RDF::Statement(ex.s, ex.p, node)
+      dereified = graph.dereified
+      expect(dereified.count).to eq 1
+      statement = dereified.first
+      expect(statement.subject).to eq ex.s
+      expect(statement.object).to be_a_statement
+      expect(statement.object).to eq RDF::Statement(ex.a, ex.b, ex.c)
+      expect(statement.object).to be_tripleTerm
+    end
+
+    it "replaces references in subject position" do
+      graph << RDF::Statement(node, ex.rating, 5)
+      statement = graph.dereified.first
+      expect(statement.subject).to eq RDF::Statement(ex.a, ex.b, ex.c)
+    end
+
+    it "resolves nested reification nodes recursively" do
+      outer = RDF::Node.new
+      graph << RDF::Statement(outer, RDF.type, RDF[:Statement])
+      graph << RDF::Statement(outer, RDF.subject, ex.x)
+      graph << RDF::Statement(outer, RDF.predicate, ex.y)
+      graph << RDF::Statement(outer, RDF.object, node)
+      graph << RDF::Statement(ex.s, ex.p, outer)
+      statement = graph.dereified.first
+      expect(statement.object).to eq RDF::Statement(ex.x, ex.y, RDF::Statement(ex.a, ex.b, ex.c))
+    end
+
+    it "raises AmbiguousReification for incomplete descriptions" do
+      incomplete = described_class.new
+      incomplete << RDF::Statement(node, RDF.type, RDF[:Statement])
+      incomplete << RDF::Statement(node, RDF.subject, ex.a)
+      incomplete << RDF::Statement(node, RDF.predicate, ex.b)
+      expect {incomplete.dereified}.to raise_error(RDF::Statement::AmbiguousReification)
+    end
+
+    it "raises AmbiguousReification for contradictory descriptions" do
+      graph << RDF::Statement(node, RDF.object, ex.other)
+      expect {graph.dereified}.to raise_error(RDF::Statement::AmbiguousReification)
+    end
+
+    it "raises AmbiguousReification for cyclic descriptions" do
+      other = RDF::Node.new
+      cyclic = described_class.new
+      cyclic << RDF::Statement(node, RDF.subject, other)
+      cyclic << RDF::Statement(node, RDF.predicate, ex.b)
+      cyclic << RDF::Statement(node, RDF.object, ex.c)
+      cyclic << RDF::Statement(other, RDF.subject, node)
+      cyclic << RDF::Statement(other, RDF.predicate, ex.b)
+      cyclic << RDF::Statement(other, RDF.object, ex.c)
+      expect {cyclic.dereified}.to raise_error(RDF::Statement::AmbiguousReification)
+    end
+
+    it "leaves graphs without reification untouched" do
+      plain = described_class.new
+      plain << RDF::Statement(ex.s, ex.p, ex.o)
+      expect(plain.dereified).to eq plain
+    end
+
+    it "adds recovered mappings to a caller-provided identity table" do
+      map = {}
+      graph.dereified(map: map)
+      expect(map[RDF::Statement(ex.a, ex.b, ex.c, tripleTerm: true)]).to eq node
+    end
+  end
 end

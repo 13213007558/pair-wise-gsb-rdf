@@ -29,6 +29,12 @@ module RDF
     include RDF::Resource
 
     ##
+    # Raised when reification statements describing a quoted statement are
+    # incomplete or contradictory, so that no unique statement can be
+    # recovered from them.
+    class AmbiguousReification < StandardError; end
+
+    ##
     # @private
     # @since 0.2.2
     def self.from(statement, graph_name: nil, **options)
@@ -479,22 +485,59 @@ module RDF
     ##
     # Returns a graph containing this statement in reified form.
     #
+    # Embedded (quoted) statements are expanded recursively: each quoted
+    # statement is replaced by a reification node described by its own set
+    # of reification statements. As quoting a statement does not assert it,
+    # quoted statements are not added to the resulting graph as facts.
+    #
     # @param [RDF::Term]  subject   (nil)
     #   Subject of reification.
     # @param [RDF::Term]  id   (nil)
     #   Node identifier, when subject is anonymous
     # @param [RDF::Term]  graph_name   (nil)
     #   Note, in RDF 1.1, a graph name MUST be an {Resource}.
+    # @param [Hash{RDF::Statement => RDF::Resource}] map   (nil)
+    #   Identity table mapping quoted statements to their reification
+    #   nodes. Existing entries are reused, and new entries are added, so
+    #   that a caller-provided table can be shared across multiple
+    #   conversions to keep node identity stable.
     # @return [RDF::Graph]
     # @see    http://www.w3.org/TR/rdf-primer/#reification
-    def reified(subject: nil, id: nil, graph_name: nil)
+    def reified(subject: nil, id: nil, graph_name: nil, map: nil)
+      map ||= {}
+      statements = []
+      node = subject || map[self] || RDF::Node.new(id)
+      map[self] ||= node
+      statements << [node, RDF.type,      RDF[:Statement]]
+      statements << [node, RDF.subject,   reify_term(self.subject, map, statements)]
+      statements << [node, RDF.predicate, self.predicate]
+      statements << [node, RDF.object,    reify_term(self.object, map, statements)]
       RDF::Graph.new(graph_name: graph_name) do |graph|
-        subject = subject || RDF::Node.new(id)
-        graph << [subject, RDF.type,      RDF[:Statement]]
-        graph << [subject, RDF.subject,   self.subject]
-        graph << [subject, RDF.predicate, self.predicate]
-        graph << [subject, RDF.object,    self.object]
+        statements.each {|st| graph << st}
       end
+    end
+
+    private
+
+    ##
+    # @private
+    # Replaces a quoted statement with its reification node, appending the
+    # reification statements describing it (and any nested quoted
+    # statements) to the given statements array. Any other term is
+    # returned as-is.
+    #
+    # @param [RDF::Term] term
+    # @param [Hash{RDF::Statement => RDF::Resource}] map
+    # @param [Array<Array(RDF::Resource, RDF::URI, RDF::Term)>] statements
+    # @return [RDF::Term]
+    def reify_term(term, map, statements)
+      return term unless term.is_a?(RDF::Statement)
+      node = map[term] ||= RDF::Node.new
+      statements << [node, RDF.type,      RDF[:Statement]]
+      statements << [node, RDF.subject,   reify_term(term.subject, map, statements)]
+      statements << [node, RDF.predicate, term.predicate]
+      statements << [node, RDF.object,    reify_term(term.object, map, statements)]
+      node
     end
   end
 end

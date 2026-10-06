@@ -336,6 +336,62 @@ describe RDF::Statement do
       subject {RDF::Statement(s, p, RDF::Statement(s1, p1, o1))}
       specify {expect(subject.terms).to include(s, p, s1, p1, o1)}
     end
+
+    context "#reified" do
+      let(:s1) {RDF::URI.new("http://example.org/s1")}
+      let(:p1) {RDF::URI.new("http://example.org/p1")}
+      let(:o1) {RDF::URI.new("http://example.org/o1")}
+      let(:r)  {RDF::URI.new("http://example.org/r")}
+      let(:quoted) {RDF::Statement(s1, p1, o1, tripleTerm: true)}
+
+      it "describes a plain statement with reification statements" do
+        graph = stmt.reified(subject: r)
+        expect(graph.statement?(RDF::Statement(r, RDF.type, RDF[:Statement]))).to be true
+        expect(graph.statement?(RDF::Statement(r, RDF.subject, s))).to be true
+        expect(graph.statement?(RDF::Statement(r, RDF.predicate, p))).to be true
+        expect(graph.statement?(RDF::Statement(r, RDF.object, o))).to be true
+      end
+
+      it "uses an anonymous subject by default" do
+        graph = stmt.reified
+        node = graph.subjects.first
+        expect(node).to be_a_node
+        expect(graph.statement?(RDF::Statement(node, RDF.subject, s))).to be true
+      end
+
+      it "expands embedded statements into reification nodes" do
+        graph = RDF::Statement(s, p, quoted).reified(subject: r)
+        node = graph.first_object(RDF::Statement(r, RDF.object, nil))
+        expect(node).to be_a_node
+        expect(graph.statement?(RDF::Statement(node, RDF.type, RDF[:Statement]))).to be true
+        expect(graph.statement?(RDF::Statement(node, RDF.subject, s1))).to be true
+        expect(graph.statement?(RDF::Statement(node, RDF.predicate, p1))).to be true
+        expect(graph.statement?(RDF::Statement(node, RDF.object, o1))).to be true
+      end
+
+      it "does not assert quoted statements" do
+        graph = RDF::Statement(s, p, quoted).reified
+        expect(graph.statement?(RDF::Statement(s1, p1, o1))).to be false
+      end
+
+      it "expands nested embedded statements recursively" do
+        nested = RDF::Statement(s, p, quoted, tripleTerm: true)
+        graph = RDF::Statement(s, p, nested).reified
+        graph.each_statement do |st|
+          expect(st.object).not_to be_a_statement
+        end
+        expect(graph.count).to eq 12
+      end
+
+      it "reuses nodes from a caller-provided identity table" do
+        map = {}
+        RDF::Statement(s, p, quoted).reified(map: map)
+        node = map[quoted]
+        expect(node).not_to be_nil
+        graph = RDF::Statement(s, p, quoted).reified(map: map)
+        expect(graph.statement?(RDF::Statement(node, RDF.subject, s1))).to be true
+      end
+    end
   end
 
   context "c14n" do
