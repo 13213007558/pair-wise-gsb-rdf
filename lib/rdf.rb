@@ -47,6 +47,7 @@ module RDF
   # RDF storage
   autoload :Changeset,         'rdf/changeset'
   autoload :Dataset,           'rdf/model/dataset'
+  autoload :MergeableRepository, 'rdf/mergeable_repository'
   autoload :Repository,        'rdf/repository'
   autoload :Transaction,       'rdf/transaction'
 
